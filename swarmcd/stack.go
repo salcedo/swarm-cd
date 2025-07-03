@@ -7,8 +7,11 @@ import (
 	"log/slog"
 	"os"
 	"path"
+	"strconv"
+	"strings"
 	"text/template"
 
+	"github.com/docker/cli/cli/command/service"
 	"github.com/docker/cli/cli/command/stack"
 	"github.com/goccy/go-yaml"
 	"github.com/m-adawi/swarm-cd/util"
@@ -89,6 +92,12 @@ func (swarmStack *swarmStack) updateStack() (revision string, err error) {
 
 	log.Debug("rotating configs and secrets...")
 	err = swarmStack.rotateConfigsAndSecrets(stackContents)
+	if err != nil {
+		return
+	}
+
+	log.Debug("preserving service replica counts...")
+	err = swarmStack.preserveServiceReplicas(stackContents)
 	if err != nil {
 		return
 	}
@@ -242,10 +251,118 @@ func (swarmStack *swarmStack) writeStack(composeMap map[string]any) error {
 	return nil
 }
 
+// getServiceReplicas gets the current replica count for a service in the swarm
+// Returns the replica count and whether the service exists
+func (swarmStack *swarmStack) getServiceReplicas(serviceName string) (int, bool, error) {
+	cmd := service.NewServiceCommand(dockerCli)
+
+	// Create a buffer to capture output
+	var outputBuffer bytes.Buffer
+	cmd.SetOut(&outputBuffer)
+
+	// Use service inspect to get service details
+	cmd.SetArgs([]string{"inspect", "--format", "{{.Spec.Mode.Replicated.Replicas}}", serviceName})
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+
+	err := cmd.Execute()
+	if err != nil {
+		// Service doesn't exist
+		return 0, false, nil
+	}
+
+	output := strings.TrimSpace(outputBuffer.String())
+	if output == "" || output == "<nil>" {
+		// Service exists but is not in replicated mode (might be global)
+		return 0, false, nil
+	}
+
+	replicas, err := strconv.Atoi(output)
+	if err != nil {
+		return 0, false, fmt.Errorf("could not parse replica count for service %s: %w", serviceName, err)
+	}
+
+	return replicas, true, nil
+}
+
+// preserveServiceReplicas scans the stack contents for replicated services and preserves their current replica counts
+func (swarmStack *swarmStack) preserveServiceReplicas(stackContents map[string]any) error {
+	log := logger.With(
+		slog.String("stack", swarmStack.name),
+		slog.String("branch", swarmStack.branch),
+	)
+
+	services, ok := stackContents["services"].(map[string]any)
+	if !ok {
+		// No services section, nothing to do
+		return nil
+	}
+
+	for serviceName, service := range services {
+		serviceMap, ok := service.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		// Check if this service uses replicated mode (either explicitly or implicitly)
+		if !swarmStack.isReplicatedService(serviceMap) {
+			continue
+		}
+
+		// Construct the full service name as it appears in Docker Swarm
+		fullServiceName := swarmStack.name + "_" + serviceName
+
+		// Get current replica count from the swarm
+		currentReplicas, exists, err := swarmStack.getServiceReplicas(fullServiceName)
+		if err != nil {
+			log.Warn("failed to get replica count for service", "service", fullServiceName, "error", err)
+			continue
+		}
+
+		if !exists {
+			// Service doesn't exist in swarm, keep the compose file value
+			log.Debug("service does not exist in swarm, keeping compose file value", "service", fullServiceName)
+			continue
+		}
+
+		// Service exists, preserve its current replica count
+		log.Debug("preserving current replica count", "service", fullServiceName, "replicas", currentReplicas)
+
+		// Update the deploy section with the current replica count
+		deploy, ok := serviceMap["deploy"].(map[string]any)
+		if !ok {
+			deploy = make(map[string]any)
+			serviceMap["deploy"] = deploy
+		}
+
+		deploy["replicas"] = currentReplicas
+	}
+
+	return nil
+}
+
+// isReplicatedService checks if a service is using replicated mode
+func (swarmStack *swarmStack) isReplicatedService(serviceMap map[string]any) bool {
+	deploy, ok := serviceMap["deploy"].(map[string]any)
+	if !ok {
+		// No deploy section means default replicated mode
+		return true
+	}
+
+	mode, ok := deploy["mode"].(string)
+	if !ok {
+		// No mode specified means default replicated mode
+		return true
+	}
+
+	// Only replicated mode services should have their replicas preserved
+	return mode == "replicated"
+}
+
 func (swarmStack *swarmStack) deployStack() error {
 	cmd := stack.NewStackCommand(dockerCli)
 	cmd.SetArgs([]string{
-		"deploy", "--detach", "--with-registry-auth", "-c",
+		"deploy", "--detach", "--prune", "--with-registry-auth", "-c",
 		path.Join(swarmStack.repo.path, swarmStack.composePath),
 		swarmStack.name,
 	})
