@@ -1,5 +1,5 @@
 # Stage 1: Build the frontend
-FROM node:22-alpine3.19 AS frontend-build
+FROM node:22-alpine AS frontend-build
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm install
@@ -9,7 +9,7 @@ RUN npm run build
 RUN npm run test
 
 # Stage 2: Build the backend
-FROM golang:1.22.5 AS backend-build
+FROM golang:1 AS backend-build
 WORKDIR /backend
 COPY go.mod go.sum ./
 RUN go mod download
@@ -21,7 +21,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /swarm-cd ./cmd/
 RUN go test ./swarmcd/
 
 # Stage 3: Final production image (depends on previous stages)
-FROM alpine:3.2
+FROM alpine:3
 WORKDIR /app
 RUN apk add --no-cache ca-certificates && update-ca-certificates
 # Copy the built backend binary from the backend build stage
