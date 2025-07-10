@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/md5"
 	"fmt"
+	"github.com/docker/cli/cli/command"
+	"github.com/docker/cli/cli/flags"
 	"log/slog"
 	"os"
 	"path"
@@ -254,19 +256,40 @@ func (swarmStack *swarmStack) writeStack(composeMap map[string]any) error {
 // getServiceReplicas gets the current replica count for a service in the swarm
 // Returns the replica count and whether the service exists
 func (swarmStack *swarmStack) getServiceReplicas(serviceName string) (int, bool, error) {
-	cmd := service.NewServiceCommand(dockerCli)
-
 	// Create a buffer to capture output
-	var outputBuffer bytes.Buffer
-	cmd.SetOut(&outputBuffer)
+	outputBuffer := new(bytes.Buffer)
+	// The inspect command use DockerCli.Out()
+	dockerCliWithOutput, err := command.NewDockerCli(
+		command.WithOutputStream(outputBuffer),
+		command.WithErrorStream(outputBuffer),
+	)
+	if err != nil {
+		logger.Warn("could not create docker cli", "error", err)
+		return 0, false, fmt.Errorf("could not create docker cli: %w", err)
+	}
+	err = dockerCliWithOutput.Initialize(flags.NewClientOptions())
+	if err != nil {
+		logger.Warn("could not initialize docker cli", "error", err)
+		return 0, false, fmt.Errorf("could not initialize docker cli: %w", err)
+	}
+	// close the client
+	defer func(cli *command.DockerCli) {
+		err := cli.Client().Close()
+		if err != nil {
+			logger.Warn("could not close docker client", "error", err)
+		}
+	}(dockerCliWithOutput)
+
+	cmd := service.NewServiceCommand(dockerCliWithOutput)
 
 	// Use service inspect to get service details
 	cmd.SetArgs([]string{"inspect", "--format", "{{.Spec.Mode.Replicated.Replicas}}", serviceName})
 	cmd.SilenceErrors = true
 	cmd.SilenceUsage = true
 
-	err := cmd.Execute()
+	err = cmd.Execute()
 	if err != nil {
+		logger.Warn("error when getting replicas", "service", serviceName, "error", err)
 		// Service doesn't exist
 		return 0, false, nil
 	}
@@ -326,7 +349,7 @@ func (swarmStack *swarmStack) preserveServiceReplicas(stackContents map[string]a
 		}
 
 		// Service exists, preserve its current replica count
-		log.Debug("preserving current replica count", "service", fullServiceName, "replicas", currentReplicas)
+		log.Info("preserving current replica count", "service", fullServiceName, "replicas", currentReplicas)
 
 		// Update the deploy section with the current replica count
 		deploy, ok := serviceMap["deploy"].(map[string]any)
